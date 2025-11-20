@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.10)
+project(ggml_tpu C)
+
+add_library(ggml_tpu STATIC ggml_tpu.c)
+
+# 如果需要链接 pthread
+find_package(Threads REQUIRED)
+target_link_libraries(ggml_tpu PRIVATE Threads::Threads)
+
+# 包含 ggml 头路径（根据项目调整）
+target_include_directories(ggml_tpu PRIVATE ${CMAKE_SOURCE_DIR}/../path/to/ggml/include)

@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
-
+//f16 printf
+#include <immintrin.h>
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
@@ -1109,6 +1110,53 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+//void ggml_dequantize_any(const struct ggml_tensor *src, float *dst) {
+//		ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(src->type)->to_float;
+//    const int64_t nrows = src->ne[1];
+//    const int64_t ncols = src->ne[0];
+//
+//    for (int i = 0; i < nrows; i++) {
+//        const void *row_q = (uint8_t *)src->data + i * src->nb[1];
+//        float *row_f = dst + i * ncols;
+//
+//        switch (src->type) {
+//            case GGML_TYPE_Q3_K:
+//                dequantize_row_q(row_q, row_f, ncols);
+//                break;
+//            case GGML_TYPE_Q5_K:
+//                dequantize_row_q(row_q, row_f, ncols);
+//                break;
+//            case GGML_TYPE_Q4_0:
+//                dequantize_row_q(row_q, row_f, ncols);
+//                break;
+//            case GGML_TYPE_F16:
+//                dequantize_row_f16(row_q, row_f, ncols);
+//                break;
+//            case GGML_TYPE_F32:
+//                // 不需要解量化
+//                memcpy(row_f, row_q, ncols * sizeof(float));
+//                break;
+//            default:
+//                fprintf(stderr, "Unsupported quant type: %d\n", src->type);
+//                exit(1);
+//        }
+//    }
+//}
+void ggml_tensor_to_float_rows(const struct ggml_tensor *src, float *out) {
+    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(src->type)->to_float;
+    int64_t nrows = src->ne[1];
+    int64_t ncols = src->ne[0];
+
+    for (int64_t r = 0; r < nrows; r++) {
+        const void *src_row = (const char *)src->data + r * src->nb[1];
+				//printf("src_row = %p %s NULL , r = %ld\n", src_row, src_row == NULL ? "is" : "isn't", r);
+				//fflush(stdout);
+        float *dst_row = out + r * ncols;
+				//printf("dst_row = %p %s NULL , r = %ld\n", dst_row, (dst_row + ncols * sizeof(float)) == NULL ? "is" : "isn't", r);
+				//fflush(stdout);
+        dequantize_row_q(src_row, dst_row, ncols);
+    }
+}
 
 // ggml_compute_forward_mul_mat
 
@@ -1121,6 +1169,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t ir0_end,
     const int64_t ir1_start,
     const int64_t ir1_end) {
+
+		int use_tpu = 1;
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1159,47 +1209,74 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
-    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
-        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
-                const int64_t i13 = (ir1 / (ne12 * ne1));
-                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
-                const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+    if (use_tpu) {
+        int M = ir0_end - ir0_start;
+        int N = ir1_end - ir1_start;
+        int K = ne00;  // 内积维度
+																					
+				float *a_f32 = malloc(sizeof(float) * src0->ne[1] * src0->ne[0]);
+				ggml_tensor_to_float_rows(src0, a_f32);
+				int64_t nb1_f32, nb0_f32;
+				nb0_f32 = sizeof(float);
+				nb1_f32 = sizeof(float) * ne00;
 
-                // broadcast src0 into src1
-                const int64_t i03 = i13 / r3;
-                const int64_t i02 = i12 / r2;
+        uint8_t *a_block = (uint8_t*)(a_f32) + ir0_start * nb1_f32;
+        uint8_t *b_block = (uint8_t*)(src1->data) ;
+        uint8_t *c_block = (uint8_t*)(dst->data) + (ir0_start * nb1 + ir1_start * nb0);
 
-                const int64_t i1 = i11;
-                const int64_t i2 = i12;
-                const int64_t i3 = i13;
+				uint8_t *tpu_systolic(uint8_t *a, uint8_t *b, uint8_t *c, uint8_t *d,
+				                      int nb_a_row, int nb_a_col,
+				                      int nb_b_row, int nb_b_col,
+				                      int nb_d_row, int nb_d_col,
+				                      int matrix_a_row, int matrix_a_col,
+				                      int matrix_b_row, int matrix_b_col,
+				                      int mode); 
+        tpu_systolic(a_block, b_block, NULL, c_block,
+										 nb1_f32, nb0_f32,      // A 的 stride
+				    				 src1->nb[0], src1->nb[1],      // B 的 stride
+				    				 nb1,  nb0,       // D 的 stride
+                     M, K, K, N, 0);
+			free(a_f32);
+    } else {
+      for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+          for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+              for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+                  const int64_t i13 = (ir1 / (ne12 * ne1));
+                  const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                  const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                  // broadcast src0 into src1
+                  const int64_t i03 = i13 / r3;
+                  const int64_t i02 = i12 / r2;
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
-                const char * src1_col = (const char*)wdata +
-                    (src1_cont || src1->type != vec_dot_type
-                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
-                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
-                float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+                  const int64_t i1 = i11;
+                  const int64_t i2 = i12;
+                  const int64_t i3 = i13;
 
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
+                  const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
 
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
-                }
+                  // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                  //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                  //       the original src1 data pointer, so we should index using the indices directly
+                  // TODO: this is a bit of a hack, we should probably have a better way to handle this
+                  const char * src1_col = (const char*)wdata +
+                      (src1_cont || src1->type != vec_dot_type
+                          ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                          : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                  float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
-                }
-            }
-        }
-    }
+                  for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                      vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                  }
+
+                  for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                      memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+		  								fprintf(stderr, "dst_col[%d] = %f\n", iir0 + cn * nb1 / nb0, dst_col[iir0 + cn * nb1 / nb0]);
+                  }
+              }
+          }
+      }
+		}
 }
 
 void ggml_compute_forward_mul_mat(
@@ -1386,6 +1463,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
+
         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
