@@ -1170,7 +1170,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t ir1_start,
     const int64_t ir1_end) {
 
-		int use_tpu = 1;
+		int use_tpu = 0;
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1271,7 +1271,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                   for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                       memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
-		  								fprintf(stderr, "dst_col[%d] = %f\n", iir0 + cn * nb1 / nb0, dst_col[iir0 + cn * nb1 / nb0]);
                   }
               }
           }
